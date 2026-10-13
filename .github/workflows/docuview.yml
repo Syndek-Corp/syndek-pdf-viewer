@@ -1,0 +1,160 @@
+# DocuView: builds the Syndek-branded Windows installer and macOS app and publishes them as a
+# GitHub release in this repository. Run it from Actions > DocuView Build > Run workflow.
+#
+# Self-contained on purpose: it does not call storytold's shared workflows, so nothing upstream
+# changes can alter this build or see its signing secrets. The branding is applied at build time
+# by branding/apply.py; the rest of the repository stays identical to upstream.
+#
+# Signing: Windows files are signed when the six AZURE_* secrets are set in the `release`
+# environment (see issue #1); without them the build still succeeds and ships unsigned. The Mac
+# app is ad-hoc signed (first launch: System Settings > Privacy & Security > Open Anyway).
+
+name: DocuView Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a GitHub release (off: just build and keep the files on the run)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docuview-build
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    environment: release
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Find the pinned craft-fonts commit
+        id: fonts
+        shell: bash
+        run: echo "ref=$(grep -oE 'craft-fonts-ref:[[:space:]]*[0-9a-f]{40}' .github/workflows/release.yml | grep -oE '[0-9a-f]{40}')" >>"$GITHUB_OUTPUT"
+      - name: Check out craft-fonts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: storytold/craft-fonts
+          ref: ${{ steps.fonts.outputs.ref }}
+          path: craft-fonts
+      - name: Apply DocuView branding
+        run: python branding/apply.py
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: docuview-windows-x64
+      - name: Install WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g "WixToolset.UI.wixext/5.0.2" "WixToolset.Util.wixext/5.0.2"
+      - name: Build, sign, package
+        shell: pwsh
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          AZURE_CERT_PROFILE: ${{ secrets.AZURE_CERT_PROFILE }}
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CRAFT_FONTS_REQUIRED: "1"
+        run: ./packaging/windows/package.ps1 -Arch x64
+      - name: Name the files DocuView
+        shell: bash
+        run: |
+          cd dist/release
+          for f in pdfcraft-*; do mv "$f" "docuview-${f#pdfcraft-}"; done
+          ls -l
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: docuview-windows-x64
+          path: |
+            dist/release/*.msi
+            dist/release/*-portable.zip
+          if-no-files-found: error
+
+  macos:
+    name: macOS universal
+    runs-on: macos-15
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Find the pinned craft-fonts commit
+        id: fonts
+        run: echo "ref=$(grep -oE 'craft-fonts-ref:[[:space:]]*[0-9a-f]{40}' .github/workflows/release.yml | grep -oE '[0-9a-f]{40}')" >>"$GITHUB_OUTPUT"
+      - name: Check out craft-fonts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: storytold/craft-fonts
+          ref: ${{ steps.fonts.outputs.ref }}
+          path: craft-fonts
+      - name: Apply DocuView branding
+        run: python3 branding/apply.py
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: docuview-macos-universal
+      - name: Build and package (ad-hoc signed)
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CRAFT_FONTS_REQUIRED: "1"
+        run: packaging/macos/package.sh --arch universal
+      - name: Name the files DocuView
+        run: |
+          cd dist/release
+          for f in pdfcraft-*; do mv "$f" "docuview-${f#pdfcraft-}"; done
+          ls -l
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: docuview-macos
+          path: dist/release/*.dmg
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: inputs.publish
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: files
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(awk '/^\[/ { p = ($0 == "[workspace.package]"); next } p && $1 == "version" { gsub(/[" ]/, "", $3); print $3; exit }' Cargo.toml)
+          # "+docuview.N" keeps each build's tag unique; DocuView's update check ignores it.
+          tag="v${version}+docuview.${GITHUB_RUN_NUMBER}"
+          cat >notes.md <<EOF
+          DocuView ${version} (build ${GITHUB_RUN_NUMBER}), based on PdfCraft ${version} at \`${GITHUB_SHA::9}\`.
+
+          **Windows:** download \`docuview-${version}-windows-x64.msi\` and run it.
+          **Mac:** download the \`.dmg\`, drag DocuView to Applications, then on first launch open
+          System Settings > Privacy & Security and click **Open Anyway**.
+
+          Found a problem? Use the **Feedback** button in the app, or open an issue here.
+          EOF
+          gh release create "$tag" files/* --target "$GITHUB_SHA" --title "DocuView ${version} (build ${GITHUB_RUN_NUMBER})" --notes-file notes.md --latest

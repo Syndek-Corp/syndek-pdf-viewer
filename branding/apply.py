@@ -40,7 +40,9 @@ COMPONENT_GUIDS = {
     "DC028192-C233-4F99-9A77-ED458C60DF26": "EA5B40C4-4AB3-4EBD-910C-54C79F6AD524",  # Start Menu shortcut
     "F6948627-32AB-4D78-8865-0FDF417CE442": "0848DA53-8DA1-479A-A875-A807ABBD2797",  # desktop shortcut
     "439F084F-657D-4AC2-A4CC-F099C518D71F": "3C29367F-5330-4D07-A510-8A460D798B22",  # PDF context menu
+    "1B783BF3-12DF-4588-AF80-E2CEA8BC1E5A": "30CA1F29-0CE3-4235-B2E1-E3625EF186C0",  # image context menu (0.9.0)
 }
+GUID_RE = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
 
 # 1. The display name, as a whole word ("PdfCraft", not "PdfCraftApp" or "pdfcraft"), in the
 #    files people see the name from: window, menus, dialogs, installer, macOS bundle.
@@ -107,12 +109,32 @@ EDITS: list[tuple[str, str, str, int | None]] = [
     # Installer: publisher, support links, and DocuView's own installer identity.
     ("packaging/windows/pdfcraft.wxs", 'Manufacturer="Learning Machines LLC"', f'Manufacturer="{COMPANY}"', 2),
     ("packaging/windows/test-msi.ps1", "'Learning Machines LLC'", f"'{COMPANY}'", 1),
-    ("packaging/windows/pdfcraft.wxs", "EA00C367-7270-4C50-9D8B-A7A5C88AD27F", UPGRADE_CODE, 1),
+    # The UpgradeCode, and (since 0.9.0) the <Upgrade> table that detects earlier installs of it.
+    ("packaging/windows/pdfcraft.wxs", "EA00C367-7270-4C50-9D8B-A7A5C88AD27F", UPGRADE_CODE, None),
     *[("packaging/windows/pdfcraft.wxs", old, new, 1) for old, new in COMPONENT_GUIDS.items()],
     ("packaging/windows/pdfcraft.wxs", '"https://getartcraft.com/apps/pdfcraft"', f'"{RELEASES_URL}"', 2),
     ("packaging/windows/pdfcraft.wxs", '"https://discord.gg/artcraft"', f'"{FEEDBACK_URL}"', 1),
     ("packaging/windows/pdfcraft.wxs", '"DocuView PDF workbench"', f'"{APP_NAME} PDF viewer"', None),
     ("packaging/windows/pdfcraft.wxs", '"Open-source PDF workbench"', '"PDF viewer and editor"', 1),
+    # macOS About panel (since 0.9.0).
+    (
+        "packaging/macos/Credits.rtf",
+        "A clean-room, open-source PDF application written in Rust.",
+        "Based on the open-source PdfCraft project (github.com/storytold/pdfcraft).",
+        1,
+    ),
+    (
+        "packaging/macos/Credits.rtf",
+        '{\\field{\\*\\fldinst{HYPERLINK "https://getartcraft.com"}}{\\fldrslt getartcraft.com}}',
+        f"Made for {COMPANY}",
+        1,
+    ),
+    (
+        "packaging/macos/Credits.rtf",
+        '{\\field{\\*\\fldinst{HYPERLINK "https://discord.gg/artcraft"}}{\\fldrslt discord.gg/artcraft}}',
+        '{\\field{\\*\\fldinst{HYPERLINK "' + FEEDBACK_URL + '"}}{\\fldrslt Send feedback}}',
+        1,
+    ),
     # macOS bundle identity.
     ("packaging/macos/Info.plist.in", "ai.storyteller.pdfcraft", BUNDLE_ID, None),
     ("packaging/macos/Info.plist.in", "Copyright © the DocuView authors.", f"Copyright © {COMPANY} and the PdfCraft authors.", 1),
@@ -174,6 +196,13 @@ def main() -> int:
             continue
         write(path, text.replace(old, new))
     print(f"applied {len(EDITS)} edits")
+
+    # Every installer GUID must now be one of DocuView's. A GUID upstream adds later (a new
+    # component) would otherwise be shared with PdfCraft installs; give it its own entry above.
+    ours = {UPGRADE_CODE, *COMPONENT_GUIDS.values()}
+    for path in sorted((ROOT / "packaging/windows").glob("*.wxs")):
+        for guid in sorted(set(GUID_RE.findall(read(path))) - ours):
+            problems.append(f"{path.relative_to(ROOT).as_posix()}: GUID {guid} is upstream's; add a DocuView one to COMPONENT_GUIDS")
 
     for src, dst in COPIES:
         target = ROOT / dst

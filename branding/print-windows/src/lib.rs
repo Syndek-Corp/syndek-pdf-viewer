@@ -11,14 +11,21 @@
 //! driver at 600 dpi: 44 s on the client and 19 MB of PostScript per page. This path, same driver,
 //! same document: 3–7 s, and each sheet is sent in the smallest form the driver takes:
 //!
-//! - black-and-white sheets (text, line art) as 1-bit at the printer's resolution, which is what
-//!   the engine prints for text anyway: 0.3–1 MB a sheet;
-//! - grey sheets as 8-bit grey;
+//! - black-and-white sheets (text, line art) as 1-bit at the printer's resolution, ordered-dithered
+//!   so light grey text and tints survive as the halftone the engine prints anyway: 0.3–1 MB a sheet;
+//! - grey sheets (photographs, large tints) as 8-bit grey;
 //! - colour sheets as JPEG when the driver is a PostScript one (it passes JPEG through as
 //!   `DCTDecode`, ~3 MB a sheet) and as 24-bit otherwise (PCL drivers compress on their own).
 //!
+//! Sheets render at the printer's resolution up to [`MAX_RENDER_DPI`]. A sheet that fits in
+//! [`WHOLE_SHEET_BYTES`] is rendered whole (Letter at 600 dpi); a larger one (Legal, Tabloid, a
+//! plotter sheet, or a 1200 dpi driver) is rendered and sent in bands of [`BAND_ROWS`] rows, so
+//! paper size never lowers the resolution or exhausts memory. The next sheet renders on a worker
+//! thread while the current one is encoded and sent.
+//!
 //! Copies, collation, two-sided, colour, paper and orientation go through `DEVMODE`, validated by
-//! the driver (`DocumentProperties`). Sheets of the other orientation turn the job with `ResetDC`
+//! the driver (`DocumentProperties`); a size the driver doesn't list is asked for as a custom size
+//! when the driver takes those. Sheets of the other orientation turn the job with `ResetDC`
 //! between pages. All GDI calls are in this crate, wrapped so callers see only `Result`.
 
 #![cfg_attr(not(windows), allow(dead_code, unused_imports))]
@@ -52,6 +59,33 @@ pub struct Job<'a> {
     pub shrink_to_fit: bool,
 }
 
+/// Sheets never render above this: a 1200 dpi driver gets 600 dpi images scaled 2x, which prints
+/// the same as a 600 dpi engine would, at a quarter of the time and memory.
+const MAX_RENDER_DPI: f32 = 600.0;
+
+/// A sheet whose RGBA render is at most this big is rendered whole (and classified from the whole
+/// sheet); bigger ones are sent in bands. Letter at 600 dpi is 135 MB.
+const WHOLE_SHEET_BYTES: u64 = 160 * 1024 * 1024;
+
+/// Rows per band when a sheet is streamed.
+const BAND_ROWS: u32 = 1024;
+
+/// The renderer draws a tile of at most this many pixels a side.
+const TILE: u32 = 4096;
+
+/// A streamed sheet is classified (colour, grey or black-and-white) from a render at this
+/// resolution, made before the bands.
+const PROBE_DPI: f32 = 200.0;
+
+/// Mid-tone pixels per thousand above which a grey sheet keeps 8 bits, measured at the printer's
+/// resolution (600 dpi): a page of 10–11 pt text has 17–22‰ anti-aliased edge pixels, the same
+/// page with a light grey box on a twentieth of it 72‰, and a page with a photograph several
+/// hundred.
+const MONO_MID_PERMILLE: usize = 120;
+
+/// The same limit for a [`PROBE_DPI`] render, where text edges take three times the share.
+const PROBE_MONO_MID_PERMILLE: usize = 250;
+
 /// A sheet's size in points (after rotation), as the print-ready PDF displays it.
 fn sheet_sizes(pdf: &Arc<Vec<u8>>) -> Result<Vec<(f32, f32)>, String> {
     let info = pdfcraft_render::inspect(Arc::clone(pdf), None).map_err(|e| format!("the print-ready PDF can't be read: {e}"))?;
@@ -62,65 +96,77 @@ fn sheet_sizes(pdf: &Arc<Vec<u8>>) -> Result<Vec<(f32, f32)>, String> {
     Ok(sizes)
 }
 
-/// Render sheet `page` at `scale` device pixels per point as premultiplied RGBA: `(width,
-/// height, pixels)`. A sheet the renderer can draw in one go (its caps: 8192 px a side, 64 M
-/// pixels) is rendered whole; a larger one (Legal and Tabloid at 600 dpi, anything bigger) is
-/// rendered in tiles at the full scale and stitched, so no sheet is sent below the printer's
-/// resolution. A sheet that would need more than [`MAX_SHEET_BYTES`] falls back to the
-/// renderer's capped whole-page render, which the driver then scales up.
-fn render_sheet(renderer: &mut PageRenderer, page: usize, w_pt: f32, h_pt: f32, scale: f32) -> Result<(u32, u32, Vec<u8>), String> {
+/// Render sheet `page` whole at `scale` (capped by the renderer's limits: 8192 px a side, 64 M
+/// pixels): `(width, height, premultiplied RGBA)`.
+fn render_whole(renderer: &mut PageRenderer, page: usize, w_pt: f32, h_pt: f32, scale: f32) -> Result<(u32, u32, Vec<u8>), String> {
     let n = page + 1;
     let capped = effective_scale(w_pt, h_pt, scale);
-    let (full_w, full_h) = (device_pixels(w_pt, scale), device_pixels(h_pt, scale));
-    let bytes = u64::from(full_w) * u64::from(full_h) * 4;
-    if capped >= scale * 0.999 || bytes > MAX_SHEET_BYTES || full_w == 0 || full_h == 0 {
-        let r = renderer.render(RenderRequest { page, scale: capped, tag: PRINT_TAG, ..Default::default() });
-        if let Some(e) = r.error {
-            return Err(format!("sheet {n} could not be rendered: {e}"));
-        }
-        if r.width == 0 || r.height == 0 {
-            return Err(format!("sheet {n} rendered empty"));
-        }
-        return Ok((r.width, r.height, r.rgba.to_vec()));
+    let r = renderer.render(RenderRequest { page, scale: capped, tag: PRINT_TAG, ..Default::default() });
+    if let Some(e) = r.error {
+        return Err(format!("sheet {n} could not be rendered: {e}"));
     }
+    if r.width == 0 || r.height == 0 {
+        return Err(format!("sheet {n} rendered empty"));
+    }
+    Ok((r.width, r.height, r.rgba.to_vec()))
+}
+
+/// Render rows `y..y + rows` of sheet `page` at `scale` (uncapped: tiles may be asked for at any
+/// scale), `full_w` pixels wide, as premultiplied RGBA.
+fn render_band(renderer: &mut PageRenderer, page: usize, scale: f32, full_w: u32, y: u32, rows: u32) -> Result<Vec<u8>, String> {
+    let n = page + 1;
+    let (fw, rows_u) = (full_w as usize, rows as usize);
     let mut rgba = Vec::new();
-    rgba.try_reserve_exact(bytes as usize).map_err(|_| format!("sheet {n}: not enough memory for a {full_w} x {full_h} render"))?;
-    rgba.resize(bytes as usize, 0);
-    let fw = full_w as usize;
-    for ty in (0..full_h).step_by(TILE as usize) {
+    rgba.try_reserve_exact(fw * rows_u * 4).map_err(|_| format!("sheet {n}: not enough memory for a {full_w} x {rows} band"))?;
+    rgba.resize(fw * rows_u * 4, 0);
+    for ty in (0..rows).step_by(TILE as usize) {
+        let th = TILE.min(rows - ty);
         for tx in (0..full_w).step_by(TILE as usize) {
-            let (tw, th) = (TILE.min(full_w - tx), TILE.min(full_h - ty));
-            let r =
-                renderer.render(RenderRequest { page, scale, tile: Some(Tile { x: tx, y: ty, w: tw, h: th }), tag: PRINT_TAG, ..Default::default() });
+            let tw = TILE.min(full_w - tx);
+            let tile = Tile { x: tx, y: y + ty, w: tw, h: th };
+            let r = renderer.render(RenderRequest { page, scale, tile: Some(tile), tag: PRINT_TAG, ..Default::default() });
             if let Some(e) = r.error {
-                return Err(format!("sheet {n} could not be rendered (tile at {tx}, {ty}): {e}"));
+                return Err(format!("sheet {n} could not be rendered (tile at {tx}, {}): {e}", y + ty));
             }
             let (rw, rh) = (r.width as usize, r.height as usize);
-            let (cw, ch) = (rw.min(tw as usize), rh.min(th as usize));
-            if cw < tw as usize || ch < th as usize {
-                return Err(format!("sheet {n}: tile at {tx}, {ty} came back {rw} x {rh}, not {tw} x {th}"));
+            if rw < tw as usize || rh < th as usize {
+                return Err(format!("sheet {n}: tile at {tx}, {} came back {rw} x {rh}, not {tw} x {th}", y + ty));
             }
             let src = r.rgba.to_vec();
-            for row in 0..ch {
+            for row in 0..th as usize {
+                let out_row = ty as usize + row;
                 let (Some(from), Some(to)) = (
-                    src.get(row * rw * 4..(row * rw + cw) * 4),
-                    rgba.get_mut(((ty as usize + row) * fw + tx as usize) * 4..((ty as usize + row) * fw + tx as usize + cw) * 4),
+                    src.get(row * rw * 4..(row * rw + tw as usize) * 4),
+                    rgba.get_mut((out_row * fw + tx as usize) * 4..(out_row * fw + tx as usize + tw as usize) * 4),
                 ) else {
-                    return Err(format!("sheet {n}: tile at {tx}, {ty} is out of bounds"));
+                    return Err(format!("sheet {n}: tile at {tx}, {} is out of bounds", y + ty));
                 };
                 to.copy_from_slice(from);
             }
         }
     }
-    Ok((full_w, full_h, rgba))
+    Ok(rgba)
 }
 
-/// The renderer draws a tile of at most this many pixels a side.
-const TILE: u32 = 4096;
-
-/// Beyond this (an A0 sheet at 600 dpi is 1.4 GB) the sheet is rendered at the renderer's
-/// capped resolution instead; the driver scales it to the paper.
-const MAX_SHEET_BYTES: u64 = 640 * 1024 * 1024;
+/// Render sheet `page` at `scale` device pixels per point as one image: whole when the renderer
+/// can draw it in one go, else assembled from bands at the full scale, so no sheet is sent below
+/// the printer's resolution.
+fn render_sheet(renderer: &mut PageRenderer, page: usize, w_pt: f32, h_pt: f32, scale: f32) -> Result<(u32, u32, Vec<u8>), String> {
+    let capped = effective_scale(w_pt, h_pt, scale);
+    let (full_w, full_h) = (device_pixels(w_pt, scale), device_pixels(h_pt, scale));
+    if capped >= scale * 0.999 || full_w == 0 || full_h == 0 {
+        return render_whole(renderer, page, w_pt, h_pt, scale);
+    }
+    let n = page + 1;
+    let bytes = full_w as usize * full_h as usize * 4;
+    let mut rgba = Vec::new();
+    rgba.try_reserve_exact(bytes).map_err(|_| format!("sheet {n}: not enough memory for a {full_w} x {full_h} render"))?;
+    for y in (0..full_h).step_by(TILE as usize) {
+        let rows = TILE.min(full_h - y);
+        rgba.extend_from_slice(&render_band(renderer, page, scale, full_w, y, rows)?);
+    }
+    Ok((full_w, full_h, rgba))
+}
 
 /// What a rendered sheet needs: the fewest bits that reproduce it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,10 +179,11 @@ enum Depth {
 }
 
 /// Classify RGBA composed over white. A sheet with colour is `Color`. A grey sheet is `Mono`
-/// unless a large share of it is mid-tones (a photograph, a big tinted area): `Mono` sheets are
-/// dithered, so light grey text or a tinted box still come out, as the halftone the engine would
-/// print anyway; `Gray` keeps 8 bits so the driver's own halftone handles the picture.
-fn classify(rgba: &[u8], grayscale: bool) -> Depth {
+/// unless more than `mono_limit` per thousand of it is mid-tones (a photograph, a big tinted
+/// area): `Mono` sheets are dithered, so light grey text or a tinted box still come out, as the
+/// halftone the engine would print anyway; `Gray` keeps 8 bits so the driver's own halftone
+/// handles the picture.
+fn classify(rgba: &[u8], grayscale: bool, mono_limit: usize) -> Depth {
     let mut mid = 0usize;
     let mut total = 0usize;
     let mut color = false;
@@ -153,17 +200,12 @@ fn classify(rgba: &[u8], grayscale: bool) -> Depth {
     }
     if color {
         Depth::Color
-    } else if total > 0 && mid.saturating_mul(1000) / total < MONO_MID_PERMILLE {
+    } else if total > 0 && mid.saturating_mul(1000) / total < mono_limit {
         Depth::Mono
     } else {
         Depth::Gray
     }
 }
-
-/// Mid-tone pixels per thousand above which a grey sheet keeps 8 bits. Measured at 600 dpi: a
-/// page of 10–11 pt text has 17–22‰ anti-aliased edge pixels, the same page with a light grey
-/// box on a twentieth of it 72‰, and a page with a photograph several hundred.
-const MONO_MID_PERMILLE: usize = 120;
 
 /// 8 × 8 Bayer ordered-dither matrix (thresholds 0–63): light greys become sparse dots, dark
 /// greys dense ones, at the printer's own dot pitch.
@@ -224,31 +266,31 @@ fn header(width: u32, height: u32, bit_count: u16, compression: u32, size_image:
     h
 }
 
-/// Rows of `rgba` (top-down, `width` pixels) packed with `pack` into `row_bytes`-wide rows,
-/// bottom-up.
-fn pack_rows(rgba: &[u8], width: usize, height: usize, row_bytes: usize, mut pack: impl FnMut(&[u8], &mut [u8])) -> Vec<u8> {
+/// Rows of `rgba` (top-down, `width` pixels) packed with `pack(row_index, row, out)` into
+/// `row_bytes`-wide rows, bottom-up.
+fn pack_rows(rgba: &[u8], width: usize, height: usize, row_bytes: usize, mut pack: impl FnMut(usize, &[u8], &mut [u8])) -> Vec<u8> {
     let mut bits = vec![0u8; row_bytes * height];
     for (y, row) in rgba.chunks_exact(width * 4).take(height).enumerate() {
         let out_y = height - 1 - y;
         if let Some(out) = bits.get_mut(out_y * row_bytes..(out_y + 1) * row_bytes) {
-            pack(row, out);
+            pack(y, row, out);
         }
     }
     bits
 }
 
-fn dib_mono(rgba: &[u8], width: u32, height: u32) -> Dib {
+/// 1-bit, ordered-dithered. `y_offset` is the image's first row on the sheet, so bands of one
+/// sheet share the dither pattern's phase and join without a seam.
+fn dib_mono(rgba: &[u8], width: u32, height: u32, y_offset: usize) -> Dib {
     let (w, h) = (width as usize, height as usize);
     let row_bytes = w.div_ceil(32) * 4;
-    let mut y_row = 0usize;
-    let bits = pack_rows(rgba, w, h, row_bytes, |row, out| {
-        let bayer = &BAYER[y_row % 8];
-        y_row += 1;
+    let bits = pack_rows(rgba, w, h, row_bytes, |y, row, out| {
+        let bayer = &BAYER[(y_offset + y) % 8];
         for (x, px) in row.as_chunks::<4>().0.iter().enumerate() {
-            let y = (299 * u32::from(px[0]) + 587 * u32::from(px[1]) + 114 * u32::from(px[2])) / 1000;
+            let lum = (299 * u32::from(px[0]) + 587 * u32::from(px[1]) + 114 * u32::from(px[2])) / 1000;
             // Luminance scaled to 0..=64 against the cell's threshold (0..=63): pure white
             // clears every cell, pure black none, and 50% grey half of them.
-            if y * 64 / 255 > u32::from(bayer[x % 8])
+            if lum * 64 / 255 > u32::from(bayer[x % 8])
                 && let Some(b) = out.get_mut(x / 8)
             {
                 *b |= 0x80 >> (x % 8);
@@ -263,7 +305,7 @@ fn dib_mono(rgba: &[u8], width: u32, height: u32) -> Dib {
 fn dib_gray(rgba: &[u8], width: u32, height: u32) -> Dib {
     let (w, h) = (width as usize, height as usize);
     let row_bytes = (w + 3) & !3;
-    let bits = pack_rows(rgba, w, h, row_bytes, |row, out| {
+    let bits = pack_rows(rgba, w, h, row_bytes, |_, row, out| {
         for (px, o) in row.as_chunks::<4>().0.iter().zip(out.iter_mut()) {
             *o = ((299 * u32::from(px[0]) + 587 * u32::from(px[1]) + 114 * u32::from(px[2])) / 1000) as u8;
         }
@@ -278,7 +320,7 @@ fn dib_gray(rgba: &[u8], width: u32, height: u32) -> Dib {
 fn dib_rgb(rgba: &[u8], width: u32, height: u32) -> Dib {
     let (w, h) = (width as usize, height as usize);
     let row_bytes = (w * 3 + 3) & !3;
-    let bits = pack_rows(rgba, w, h, row_bytes, |row, out| {
+    let bits = pack_rows(rgba, w, h, row_bytes, |_, row, out| {
         for (px, o) in row.as_chunks::<4>().0.iter().zip(out.chunks_exact_mut(3)) {
             o[0] = px[2];
             o[1] = px[1];
@@ -308,14 +350,127 @@ fn dib_jpeg(rgba: &[u8], width: u32, height: u32, dpi: f64) -> Result<Dib, Strin
 /// At the printer's resolution the compression artefacts are below what the engine can print.
 const JPEG_QUALITY: u8 = 90;
 
+/// Encode an image (RGBA over white) at `depth`; `y_offset` is its first row on the sheet.
+fn encode(rgba: &[u8], width: u32, height: u32, depth: Depth, jpeg: bool, dpi: f64, y_offset: usize) -> Result<Dib, String> {
+    Ok(match depth {
+        Depth::Mono => dib_mono(rgba, width, height, y_offset),
+        Depth::Gray => dib_gray(rgba, width, height),
+        Depth::Color if jpeg => dib_jpeg(rgba, width, height, dpi)?,
+        Depth::Color => dib_rgb(rgba, width, height),
+    })
+}
+
+/// How one sheet of the job is placed and rendered. Positions are device pixels in the printable
+/// area's coordinates (the origin is the top-left of the printable area).
+#[derive(Clone, Copy, Debug)]
+struct SheetPlan {
+    index: usize,
+    landscape: bool,
+    x: i32,
+    y: i32,
+    dest_w: i32,
+    dest_h: i32,
+    /// Render scale, device pixels per point (at most [`MAX_RENDER_DPI`]).
+    scale: f32,
+}
+
+/// What the render worker hands the sending thread, in order.
+enum Msg {
+    /// A whole sheet.
+    Whole {
+        w: u32,
+        h: u32,
+        rgba: Vec<u8>,
+    },
+    /// A streamed sheet begins: its full size and a small render to classify it from.
+    Begin {
+        w: u32,
+        h: u32,
+        probe_w: u32,
+        probe_h: u32,
+        probe: Vec<u8>,
+    },
+    Band {
+        y: u32,
+        rows: u32,
+        rgba: Vec<u8>,
+    },
+    End,
+    Error(String),
+}
+
+/// The render thread: sheets in `plan` order, whole when they fit [`WHOLE_SHEET_BYTES`], else
+/// a probe and then bands. Stops when the receiver is gone.
+fn render_worker(bytes: Arc<Vec<u8>>, sizes: Vec<(f32, f32)>, plan: Vec<SheetPlan>, tx: std::sync::mpsc::SyncSender<Msg>) {
+    let mut renderer = PageRenderer::new(bytes, pdfcraft_render::RenderConfig::default());
+    let send = |m: Msg| tx.send(m).is_ok();
+    for p in plan {
+        let Some(&(w_pt, h_pt)) = sizes.get(p.index) else {
+            send(Msg::Error(format!("sheet {} has no size", p.index + 1)));
+            return;
+        };
+        let (full_w, full_h) = (device_pixels(w_pt, p.scale), device_pixels(h_pt, p.scale));
+        let whole = u64::from(full_w) * u64::from(full_h) * 4 <= WHOLE_SHEET_BYTES;
+        if whole {
+            match render_sheet(&mut renderer, p.index, w_pt, h_pt, p.scale) {
+                Ok((w, h, rgba)) => {
+                    if !send(Msg::Whole { w, h, rgba }) {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    send(Msg::Error(e));
+                    return;
+                }
+            }
+            continue;
+        }
+        let begin = render_whole(&mut renderer, p.index, w_pt, h_pt, PROBE_DPI / 72.0).map(|(probe_w, probe_h, probe)| Msg::Begin {
+            w: full_w,
+            h: full_h,
+            probe_w,
+            probe_h,
+            probe,
+        });
+        match begin {
+            Ok(m) => {
+                if !send(m) {
+                    return;
+                }
+            }
+            Err(e) => {
+                send(Msg::Error(e));
+                return;
+            }
+        }
+        for y in (0..full_h).step_by(BAND_ROWS as usize) {
+            let rows = BAND_ROWS.min(full_h - y);
+            match render_band(&mut renderer, p.index, p.scale, full_w, y, rows) {
+                Ok(rgba) => {
+                    if !send(Msg::Band { y, rows, rgba }) {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    send(Msg::Error(e));
+                    return;
+                }
+            }
+        }
+        if !send(Msg::End) {
+            return;
+        }
+    }
+}
+
 #[cfg(windows)]
 mod gdi {
     //! The Win32 side. Handles are closed in `Drop` so an error anywhere leaves nothing open,
     //! and an unfinished document is aborted rather than printed half-way.
 
     use std::ffi::c_void;
-
     use std::sync::Arc;
+    use std::sync::mpsc::{Receiver, sync_channel};
 
     use windows::Win32::Foundation::GetLastError;
     use windows::Win32::Graphics::Gdi::{
@@ -325,23 +480,28 @@ mod gdi {
     };
     use windows::Win32::Graphics::Printing::{ClosePrinter, DocumentPropertiesW, GetDefaultPrinterW, OpenPrinterW, PRINTER_HANDLE};
     use windows::Win32::Storage::Xps::{
-        AbortDoc, DC_COLLATE, DC_COPIES, DC_DUPLEX, DC_ORIENTATION, DC_PAPERNAMES, DC_PAPERS, DC_PAPERSIZE, DOCINFOW, DeviceCapabilitiesW, EndDoc,
-        EndPage, ExtEscape, PRINTER_DEVICE_CAPABILITIES, StartDocW, StartPage,
+        AbortDoc, DC_COLLATE, DC_COPIES, DC_DUPLEX, DC_MAXEXTENT, DC_MINEXTENT, DC_ORIENTATION, DC_PAPERNAMES, DC_PAPERS, DC_PAPERSIZE, DOCINFOW,
+        DeviceCapabilitiesW, EndDoc, EndPage, ExtEscape, PRINTER_DEVICE_CAPABILITIES, StartDocW, StartPage,
     };
     use windows::core::{PCWSTR, PWSTR};
 
-    use super::{Depth, Dib, Duplex, Job, classify, dib_gray, dib_jpeg, dib_mono, dib_rgb, over_white, sheet_sizes};
-    use pdfcraft_render::{PageRenderer, RenderConfig};
+    use super::{
+        Dib, Duplex, Job, MAX_RENDER_DPI, MONO_MID_PERMILLE, Msg, PROBE_MONO_MID_PERMILLE, SheetPlan, classify, encode, over_white, render_worker,
+        sheet_sizes,
+    };
 
     // DEVMODE field flags and values (wingdi.h).
     const DM_ORIENTATION: u32 = 0x0000_0001;
     const DM_PAPERSIZE: u32 = 0x0000_0002;
+    const DM_PAPERLENGTH: u32 = 0x0000_0004;
+    const DM_PAPERWIDTH: u32 = 0x0000_0008;
     const DM_COPIES: u32 = 0x0000_0100;
     const DM_COLOR: u32 = 0x0000_0800;
     const DM_DUPLEX: u32 = 0x0000_1000;
     const DM_COLLATE: u32 = 0x0000_8000;
     const DMORIENT_PORTRAIT: i16 = 1;
     const DMORIENT_LANDSCAPE: i16 = 2;
+    const DMPAPER_USER: i16 = 256;
     const DMCOLOR_MONOCHROME: i16 = 1;
     const DMDUP_SIMPLEX: i16 = 1;
     const DMDUP_VERTICAL: i16 = 2; // long edge
@@ -466,6 +626,17 @@ mod gdi {
             }
             names.get(index * 64..(index + 1) * 64).map(|s| String::from_utf16_lossy(s).trim_end_matches('\0').to_owned())
         }
+
+        /// The custom paper sizes the driver takes, as (min width, min length, max width, max
+        /// length) in tenths of a millimetre; `None` when it takes none.
+        fn custom_extent(&self) -> Option<(i32, i32, i32, i32)> {
+            let (min, max) = (self.capability(DC_MINEXTENT, None), self.capability(DC_MAXEXTENT, None));
+            if min <= 0 || max <= 0 {
+                return None;
+            }
+            let (min, max) = (min as u32, max as u32);
+            Some(((min & 0xFFFF) as i32, (min >> 16) as i32, (max & 0xFFFF) as i32, (max >> 16) as i32))
+        }
     }
 
     impl Drop for Printer {
@@ -489,8 +660,12 @@ mod gdi {
         fn as_mut_ptr(&mut self) -> *mut DEVMODEW {
             self.0.as_mut_ptr().cast()
         }
-        fn get_mut(&mut self) -> &mut DEVMODEW {
+        fn get(&self) -> &DEVMODEW {
             // SAFETY: the buffer is at least a DEVMODEW long and 8-byte aligned.
+            unsafe { &*self.as_ptr() }
+        }
+        fn get_mut(&mut self) -> &mut DEVMODEW {
+            // SAFETY: as `get`.
             unsafe { &mut *self.as_mut_ptr() }
         }
         fn set_orientation(&mut self, landscape: bool) {
@@ -498,12 +673,44 @@ mod gdi {
             dm.Anonymous1.Anonymous1.dmOrientation = if landscape { DMORIENT_LANDSCAPE } else { DMORIENT_PORTRAIT };
             dm.dmFields |= DEVMODE_FIELD_FLAGS(DM_ORIENTATION);
         }
+        fn set_paper(&mut self, id: i16) {
+            let dm = self.get_mut();
+            dm.Anonymous1.Anonymous1.dmPaperSize = id;
+            dm.dmFields |= DEVMODE_FIELD_FLAGS(DM_PAPERSIZE);
+        }
+        /// A custom size, width and length in tenths of a millimetre.
+        fn set_custom_paper(&mut self, width: i32, length: i32) {
+            let dm = self.get_mut();
+            dm.Anonymous1.Anonymous1.dmPaperSize = DMPAPER_USER;
+            dm.Anonymous1.Anonymous1.dmPaperWidth = width.clamp(0, i32::from(i16::MAX)) as i16;
+            dm.Anonymous1.Anonymous1.dmPaperLength = length.clamp(0, i32::from(i16::MAX)) as i16;
+            dm.dmFields |= DEVMODE_FIELD_FLAGS(DM_PAPERSIZE | DM_PAPERWIDTH | DM_PAPERLENGTH);
+        }
+        /// The custom size the driver kept, after validation.
+        fn custom_paper(&self) -> (i32, i32) {
+            let dm = self.get();
+            // SAFETY: reading the paper union member, which every DEVMODE for a printer holds.
+            unsafe { (i32::from(dm.Anonymous1.Anonymous1.dmPaperWidth), i32::from(dm.Anonymous1.Anonymous1.dmPaperLength)) }
+        }
+    }
+
+    /// The paper in device pixels for one orientation: printable area, physical sheet, and the
+    /// printable area's offset from the sheet's corner.
+    #[derive(Clone, Copy, Debug)]
+    struct Caps {
+        res_w: i32,
+        res_h: i32,
+        phys_w: i32,
+        phys_h: i32,
+        off_x: i32,
+        off_y: i32,
     }
 
     /// A printer device context with a document in progress.
     struct Document {
         hdc: HDC,
         started: bool,
+        in_page: bool,
     }
 
     impl Document {
@@ -514,12 +721,24 @@ mod gdi {
             if hdc.is_invalid() {
                 return Err(last_error("opening the printer"));
             }
-            Ok(Document { hdc, started: false })
+            Ok(Document { hdc, started: false, in_page: false })
         }
 
         fn cap(&self, index: GET_DEVICE_CAPS_INDEX) -> i32 {
             // SAFETY: hdc is a live device context.
             unsafe { GetDeviceCaps(Some(self.hdc), index) }
+        }
+
+        fn caps(&self) -> Caps {
+            let (res_w, res_h) = (self.cap(HORZRES).max(1), self.cap(VERTRES).max(1));
+            Caps {
+                res_w,
+                res_h,
+                phys_w: self.cap(PHYSICALWIDTH).max(res_w),
+                phys_h: self.cap(PHYSICALHEIGHT).max(res_h),
+                off_x: self.cap(PHYSICALOFFSETX).max(0),
+                off_y: self.cap(PHYSICALOFFSETY).max(0),
+            }
         }
 
         /// Whether the driver supports a printer escape.
@@ -557,11 +776,17 @@ mod gdi {
             Ok(())
         }
 
-        fn page(&mut self, dib: &Dib, dest: (i32, i32, i32, i32), src: (u32, u32)) -> Result<(), String> {
+        fn start_page(&mut self) -> Result<(), String> {
             // SAFETY: hdc has a document started.
             if unsafe { StartPage(self.hdc) } <= 0 {
                 return Err(last_error("starting a page"));
             }
+            self.in_page = true;
+            Ok(())
+        }
+
+        /// Draw `dib` (`src` pixels) stretched onto `dest` = (x, y, width, height).
+        fn draw(&mut self, dib: &Dib, dest: (i32, i32, i32, i32), src: (u32, u32)) -> Result<(), String> {
             let (x, y, w, h) = dest;
             // SAFETY: `info` starts with a BITMAPINFOHEADER followed by its palette, and `bits`
             // holds the image it describes.
@@ -583,12 +808,11 @@ mod gdi {
                 )
             };
             // GDI_ERROR is 0xFFFF_FFFF as an i32: -1. Zero rows is a failure too.
-            if lines <= 0 {
-                let e = last_error("drawing the page");
-                // SAFETY: a page was started.
-                unsafe { EndPage(self.hdc) };
-                return Err(e);
-            }
+            if lines <= 0 { Err(last_error("drawing the page")) } else { Ok(()) }
+        }
+
+        fn end_page(&mut self) -> Result<(), String> {
+            self.in_page = false;
             // SAFETY: a page was started.
             if unsafe { EndPage(self.hdc) } <= 0 {
                 return Err(last_error("finishing a page"));
@@ -609,6 +833,9 @@ mod gdi {
             // SAFETY: hdc is live; AbortDoc discards an unfinished job, DeleteDC closes the context.
             unsafe {
                 if self.started {
+                    if self.in_page {
+                        EndPage(self.hdc);
+                    }
                     AbortDoc(self.hdc);
                 }
                 let _ = DeleteDC(self.hdc);
@@ -616,16 +843,15 @@ mod gdi {
         }
     }
 
-    /// Diagnostics: with `DOCUVIEW_PRINT_DUMP=<folder>` set, every sheet is also written there as
-    /// it goes to the driver (`sheet-N.<depth>.png`, or `.jpg` for a JPEG), so the exact output
-    /// can be looked at without a printer.
-    fn dump_sheet(dib: &Dib, rgba: &[u8], width: u32, height: u32, index: usize) {
+    /// Diagnostics: with `DOCUVIEW_PRINT_DUMP=<folder>` set, every image sent to the driver is
+    /// also written there (`<label>.<depth>.png`, or `.jpg` for a JPEG; a streamed sheet's bands
+    /// are `sheet-N-yROW`), so the exact output can be looked at without a printer.
+    fn dump(dib: &Dib, rgba: &[u8], width: u32, height: u32, label: &str) {
         let Some(dir) = std::env::var_os("DOCUVIEW_PRINT_DUMP") else { return };
         let dir = std::path::PathBuf::from(dir);
         let _ = std::fs::create_dir_all(&dir);
-        let n = index + 1;
         let written = match dib.depth {
-            "jpeg" => std::fs::write(dir.join(format!("sheet-{n}.jpeg.jpg")), &dib.bits),
+            "jpeg" => std::fs::write(dir.join(format!("{label}.jpeg.jpg")), &dib.bits),
             depth => {
                 // Unpack the DIB rows (bottom-up) back into a top-down grey image of what was sent.
                 let (w, h) = (width as usize, height as usize);
@@ -634,16 +860,18 @@ mod gdi {
                     "mono" => {
                         let row_bytes = w.div_ceil(32) * 4;
                         for y in 0..h {
-                            let row = &dib.bits[(h - 1 - y) * row_bytes..];
+                            let row = dib.bits.get((h - 1 - y) * row_bytes..).unwrap_or(&[]);
                             for x in 0..w {
-                                grey[y * w + x] = if row[x / 8] & (0x80 >> (x % 8)) != 0 { 255 } else { 0 };
+                                grey[y * w + x] = if row.get(x / 8).is_some_and(|b| b & (0x80 >> (x % 8)) != 0) { 255 } else { 0 };
                             }
                         }
                     }
                     "gray" => {
                         let row_bytes = (w + 3) & !3;
                         for y in 0..h {
-                            grey[y * w..(y + 1) * w].copy_from_slice(&dib.bits[(h - 1 - y) * row_bytes..][..w]);
+                            if let Some(src) = dib.bits.get((h - 1 - y) * row_bytes..(h - 1 - y) * row_bytes + w) {
+                                grey[y * w..(y + 1) * w].copy_from_slice(src);
+                            }
                         }
                     }
                     _ => {
@@ -655,19 +883,41 @@ mod gdi {
                 let mut out = Vec::new();
                 let enc = image::codecs::png::PngEncoder::new(&mut out);
                 match image::ImageEncoder::write_image(enc, &grey, width, height, image::ExtendedColorType::L8) {
-                    Ok(()) => std::fs::write(dir.join(format!("sheet-{n}.{depth}.png")), &out),
+                    Ok(()) => std::fs::write(dir.join(format!("{label}.{depth}.png")), &out),
                     Err(e) => Err(std::io::Error::other(e.to_string())),
                 }
             }
         };
         if let Err(e) = written {
-            eprintln!("DOCUVIEW_PRINT_DUMP: sheet {n} not written: {e}");
+            eprintln!("DOCUVIEW_PRINT_DUMP: {label} not written: {e}");
         }
     }
 
     /// Points to tenths of a millimetre.
     fn tenth_mm(pt: f32) -> i32 {
         (f64::from(pt) * 25.4 / 72.0 * 10.0).round() as i32
+    }
+
+    /// Where a sheet of `w_pt` × `h_pt` goes on paper described by `caps`, and the scale to
+    /// render it at.
+    fn place(index: usize, landscape: bool, w_pt: f32, h_pt: f32, caps: Caps, dpi: (i32, i32), shrink_to_fit: bool) -> SheetPlan {
+        let sheet_w = (f64::from(w_pt) * f64::from(dpi.0) / 72.0).round() as i32;
+        let sheet_h = (f64::from(h_pt) * f64::from(dpi.1) / 72.0).round() as i32;
+        let (dest_w, dest_h, x, y) = if shrink_to_fit {
+            let scale = if sheet_w > caps.res_w || sheet_h > caps.res_h {
+                (f64::from(caps.res_w) / f64::from(sheet_w.max(1))).min(f64::from(caps.res_h) / f64::from(sheet_h.max(1)))
+            } else {
+                1.0
+            };
+            let (dw, dh) = ((f64::from(sheet_w) * scale).round() as i32, (f64::from(sheet_h) * scale).round() as i32);
+            // Centred on the physical sheet, in printable-area coordinates.
+            (dw.max(1), dh.max(1), (caps.phys_w - dw) / 2 - caps.off_x, (caps.phys_h - dh) / 2 - caps.off_y)
+        } else {
+            (sheet_w.max(1), sheet_h.max(1), -caps.off_x, -caps.off_y)
+        };
+        // One device pixel per printer dot, up to MAX_RENDER_DPI; the driver scales the rest.
+        let scale = ((f64::from(dest_w) / f64::from(w_pt.max(1.0))) as f32).min(MAX_RENDER_DPI / 72.0);
+        SheetPlan { index, landscape, x, y, dest_w, dest_h, scale }
     }
 
     /// Spool the print-ready PDF: see the crate docs.
@@ -700,30 +950,38 @@ mod gdi {
         let printer = Printer::open(&name)?;
         let mut dm = printer.default_devmode()?;
 
-        // Paper: the driver's own size for the first sheet (portrait dimensions), within a millimetre.
+        // Paper: the driver's own size for the first sheet (portrait dimensions), within a
+        // millimetre; else a custom size when the driver takes one of that size.
         let (short, long) = (tenth_mm(first.0.min(first.1)), tenth_mm(first.0.max(first.1)));
         let papers = printer.papers();
         let paper = papers.iter().position(|&(_, w, h)| (w - short).abs() <= 10 && (h - long).abs() <= 10);
+        let mut custom = false;
         match (paper, job.shrink_to_fit) {
             (Some(i), _) => {
                 if let Some(&(id, _, _)) = papers.get(i) {
-                    let d = dm.get_mut();
-                    d.Anonymous1.Anonymous1.dmPaperSize = id;
-                    d.dmFields |= DEVMODE_FIELD_FLAGS(DM_PAPERSIZE);
+                    dm.set_paper(id);
                     let _ = printer.paper_name(i);
                 }
             }
             (None, true) => {} // the driver's default paper; sheets are fitted to it below
             (None, false) => {
-                return Err(format!(
-                    "{name} has no {:.2} × {:.2} inch paper; choose a paper size it has, or add this one in its driver",
-                    first.0 / 72.0,
-                    first.1 / 72.0
-                ));
+                let fits = printer
+                    .custom_extent()
+                    .is_some_and(|(min_w, min_l, max_w, max_l)| (min_w..=max_w).contains(&short) && (min_l..=max_l).contains(&long));
+                if !fits {
+                    return Err(format!(
+                        "{name} has no {:.2} × {:.2} inch paper; choose a paper size it has, or add this one in its driver",
+                        first.0 / 72.0,
+                        first.1 / 72.0
+                    ));
+                }
+                dm.set_custom_paper(short, long);
+                custom = true;
             }
         }
         let first_landscape = first.0 > first.1 + 1.0;
-        if printer.capability(DC_ORIENTATION, None) != 0 {
+        let turns = printer.capability(DC_ORIENTATION, None) != 0;
+        if turns {
             dm.set_orientation(first_landscape);
         }
         // Copies and collation: by the driver when it can, else by this loop.
@@ -752,67 +1010,143 @@ mod gdi {
             }
         }
         printer.validate(&mut dm)?;
+        if custom {
+            let (w, l) = dm.custom_paper();
+            if (w - short).abs() > 10 || (l - long).abs() > 10 {
+                return Err(format!(
+                    "{name} would not take a custom {:.2} × {:.2} inch paper; choose a paper size it has, or add this one in its driver",
+                    first.0 / 72.0,
+                    first.1 / 72.0
+                ));
+            }
+        }
 
         let mut doc = Document::open(&printer, &dm)?;
-        let (dpi_x, dpi_y) = (doc.cap(LOGPIXELSX).max(1), doc.cap(LOGPIXELSY).max(1));
+        let dpi = (doc.cap(LOGPIXELSX).max(1), doc.cap(LOGPIXELSY).max(1));
         let postscript = doc.supports_escape(POSTSCRIPT_IDENTIFY);
         let jpeg = postscript && doc.supports_escape(CHECKJPEGFORMAT);
-        let mut renderer = PageRenderer::new(Arc::clone(&bytes), RenderConfig::default());
-        doc.start(job.title)?;
-        progress(0, count);
 
-        let mut landscape = first_landscape;
-        let mut sent = 0usize;
+        // The paper's geometry in each orientation the job uses (ResetDC before the document
+        // starts costs nothing), so every sheet can be planned up front for the render thread.
+        let mut caps_first = doc.caps();
+        let mut caps_other = caps_first;
+        let other_used = sizes.iter().any(|&(w, h)| (w > h + 1.0) != first_landscape);
+        if turns && other_used {
+            dm.set_orientation(!first_landscape);
+            printer.validate(&mut dm)?;
+            doc.reset(&dm)?;
+            caps_other = doc.caps();
+            dm.set_orientation(first_landscape);
+            printer.validate(&mut dm)?;
+            doc.reset(&dm)?;
+            caps_first = doc.caps();
+        }
         let order: Vec<usize> = if job.collate || our_copies == 1 {
             (0..our_copies as usize).flat_map(|_| 0..count).collect()
         } else {
             (0..count).flat_map(|i| std::iter::repeat_n(i, our_copies as usize)).collect()
         };
-        for &i in &order {
-            let (w_pt, h_pt) = sizes.get(i).copied().unwrap_or(first);
-            let this_landscape = w_pt > h_pt + 1.0;
-            if this_landscape != landscape && printer.capability(DC_ORIENTATION, None) != 0 {
-                dm.set_orientation(this_landscape);
-                printer.validate(&mut dm)?;
-                doc.reset(&dm)?;
-                landscape = this_landscape;
-            }
-            // The paper, in device pixels: printable area and the physical sheet.
-            let (res_w, res_h) = (doc.cap(HORZRES).max(1), doc.cap(VERTRES).max(1));
-            let (phys_w, phys_h) = (doc.cap(PHYSICALWIDTH).max(res_w), doc.cap(PHYSICALHEIGHT).max(res_h));
-            let (off_x, off_y) = (doc.cap(PHYSICALOFFSETX).max(0), doc.cap(PHYSICALOFFSETY).max(0));
-            let sheet_w = (f64::from(w_pt) * f64::from(dpi_x) / 72.0).round() as i32;
-            let sheet_h = (f64::from(h_pt) * f64::from(dpi_y) / 72.0).round() as i32;
-            let (dest_w, dest_h, x, y) = if job.shrink_to_fit {
-                let scale = if sheet_w > res_w || sheet_h > res_h {
-                    (f64::from(res_w) / f64::from(sheet_w.max(1))).min(f64::from(res_h) / f64::from(sheet_h.max(1)))
-                } else {
-                    1.0
-                };
-                let (dw, dh) = ((f64::from(sheet_w) * scale).round() as i32, (f64::from(sheet_h) * scale).round() as i32);
-                // Centred on the physical sheet, in printable-area coordinates.
-                ((dw.max(1)), (dh.max(1)), (phys_w - dw) / 2 - off_x, (phys_h - dh) / 2 - off_y)
-            } else {
-                (sheet_w.max(1), sheet_h.max(1), -off_x, -off_y)
-            };
-            // Render at the printer's resolution: one device pixel per printer dot.
-            let scale = (f64::from(dest_w) / f64::from(w_pt.max(1.0))) as f32;
-            let (rw, rh, mut rgba) = super::render_sheet(&mut renderer, i, w_pt, h_pt, scale)?;
-            over_white(&mut rgba, job.grayscale);
-            let dib = match classify(&rgba, job.grayscale) {
-                Depth::Mono => dib_mono(&rgba, rw, rh),
-                Depth::Gray => dib_gray(&rgba, rw, rh),
-                Depth::Color if jpeg => dib_jpeg(&rgba, rw, rh, f64::from(dpi_x))?,
-                Depth::Color => dib_rgb(&rgba, rw, rh),
-            };
-            dump_sheet(&dib, &rgba, rw, rh, i);
-            drop(rgba);
-            doc.page(&dib, (x, y, dest_w, dest_h), (rw, rh))?;
-            sent += 1;
-            progress(sent.min(count), count);
-        }
+        let plan: Vec<SheetPlan> = order
+            .iter()
+            .map(|&i| {
+                let (w_pt, h_pt) = sizes.get(i).copied().unwrap_or(first);
+                let landscape = w_pt > h_pt + 1.0;
+                let caps = if landscape == first_landscape || !turns { caps_first } else { caps_other };
+                place(i, landscape && turns || (!turns && first_landscape), w_pt, h_pt, caps, dpi, job.shrink_to_fit)
+            })
+            .collect();
+
+        doc.start(job.title)?;
+        progress(0, count);
+
+        // The render thread works one sheet ahead; the channel holds a couple of bands or sheets.
+        let (tx, rx) = sync_channel::<Msg>(2);
+        let worker_bytes = Arc::clone(&bytes);
+        let worker_sizes = sizes.clone();
+        let worker_plan = plan.clone();
+        let result = std::thread::scope(|s| {
+            s.spawn(move || render_worker(worker_bytes, worker_sizes, worker_plan, tx));
+            send_all(&mut doc, &printer, &mut dm, &plan, &rx, job, jpeg, dpi, first_landscape, turns, progress, count)
+        });
+        result?;
         doc.finish()?;
         Ok(format!("spooled {count} sheet(s)"))
+    }
+
+    /// The sending side: takes rendered sheets and bands off the channel in `plan` order and
+    /// draws them.
+    #[allow(clippy::too_many_arguments)]
+    fn send_all(
+        doc: &mut Document,
+        printer: &Printer,
+        dm: &mut DevMode,
+        plan: &[SheetPlan],
+        rx: &Receiver<Msg>,
+        job: &Job,
+        jpeg: bool,
+        dpi: (i32, i32),
+        first_landscape: bool,
+        turns: bool,
+        progress: &mut dyn FnMut(usize, usize),
+        count: usize,
+    ) -> Result<(), String> {
+        let mut landscape = first_landscape;
+        let dpi_f = f64::from(dpi.0);
+        let recv = || rx.recv().map_err(|_| "the renderer stopped without a result".to_string());
+        for (seq, p) in plan.iter().enumerate() {
+            let n = p.index + 1;
+            if turns && p.landscape != landscape {
+                dm.set_orientation(p.landscape);
+                printer.validate(dm)?;
+                doc.reset(dm)?;
+                landscape = p.landscape;
+            }
+            let dest = (p.x, p.y, p.dest_w, p.dest_h);
+            match recv()? {
+                Msg::Whole { w, h, mut rgba } => {
+                    over_white(&mut rgba, job.grayscale);
+                    let depth = classify(&rgba, job.grayscale, MONO_MID_PERMILLE);
+                    let dib = encode(&rgba, w, h, depth, jpeg, dpi_f, 0)?;
+                    dump(&dib, &rgba, w, h, &format!("sheet-{n}"));
+                    drop(rgba);
+                    doc.start_page()?;
+                    doc.draw(&dib, dest, (w, h))?;
+                    doc.end_page()?;
+                }
+                Msg::Begin { w, h, probe_w, probe_h, mut probe } => {
+                    over_white(&mut probe, job.grayscale);
+                    let depth = classify(&probe, job.grayscale, PROBE_MONO_MID_PERMILLE);
+                    drop(probe);
+                    let _ = (probe_w, probe_h);
+                    doc.start_page()?;
+                    loop {
+                        match recv()? {
+                            Msg::Band { y, rows, mut rgba } => {
+                                over_white(&mut rgba, job.grayscale);
+                                let dib = encode(&rgba, w, rows, depth, jpeg, dpi_f, y as usize)?;
+                                dump(&dib, &rgba, w, rows, &format!("sheet-{n}-y{y}"));
+                                drop(rgba);
+                                // The band's rows mapped onto the sheet's destination rectangle,
+                                // rounded so consecutive bands meet exactly.
+                                let row_to_dest = |r: u32| p.y + (i64::from(r) * i64::from(p.dest_h) / i64::from(h.max(1))) as i32;
+                                let (y0, y1) = (row_to_dest(y), row_to_dest(y + rows));
+                                doc.draw(&dib, (p.x, y0, p.dest_w, (y1 - y0).max(1)), (w, rows))?;
+                            }
+                            Msg::End => break,
+                            Msg::Error(e) => return Err(e),
+                            Msg::Whole { .. } | Msg::Begin { .. } => {
+                                return Err(format!("sheet {n}: the renderer sent a sheet while a band was expected"));
+                            }
+                        }
+                    }
+                    doc.end_page()?;
+                }
+                Msg::Error(e) => return Err(e),
+                Msg::Band { .. } | Msg::End => return Err(format!("sheet {n}: the renderer sent a band while a sheet was expected")),
+            }
+            progress((seq + 1).min(count), count);
+        }
+        Ok(())
     }
 }
 
@@ -837,29 +1171,29 @@ mod tests {
         let mut text = vec![[255, 255, 255]; 1000];
         text[..40].fill([0, 0, 0]);
         text[40..60].fill([128, 128, 128]); // 2% anti-aliased edges
-        assert_eq!(classify(&page(&text), false), Depth::Mono);
+        assert_eq!(classify(&page(&text), false, MONO_MID_PERMILLE), Depth::Mono);
         let mut shaded = text.clone();
         shaded[100..170].fill([230, 230, 230]); // a light grey box on 7% of the page: still dithered mono
-        assert_eq!(classify(&page(&shaded), false), Depth::Mono);
+        assert_eq!(classify(&page(&shaded), false, MONO_MID_PERMILLE), Depth::Mono);
         let mut photo = text.clone();
         photo[100..400].fill([128, 128, 128]); // a grey picture on 30% of the page
-        assert_eq!(classify(&page(&photo), false), Depth::Gray);
+        assert_eq!(classify(&page(&photo), false, MONO_MID_PERMILLE), Depth::Gray);
         let mut colour = text.clone();
         colour[0] = [31, 95, 191];
-        assert_eq!(classify(&page(&colour), false), Depth::Color);
-        assert_eq!(classify(&page(&colour), true), Depth::Mono, "a greyscale job never sends colour");
+        assert_eq!(classify(&page(&colour), false, MONO_MID_PERMILLE), Depth::Color);
+        assert_eq!(classify(&page(&colour), true, MONO_MID_PERMILLE), Depth::Mono, "a greyscale job never sends colour");
     }
 
     #[test]
     fn dibs_have_padded_bottom_up_rows() {
         let mut rgba = page(&[[0, 0, 0], [255, 255, 255], [255, 255, 255]]);
         rgba.extend(page(&[[255, 255, 255], [255, 255, 255], [0, 0, 0]])); // 3 x 2
-        let mono = dib_mono(&rgba, 3, 2);
+        let mono = dib_mono(&rgba, 3, 2, 0);
         assert_eq!(mono.bits.len(), 8, "two rows of four bytes");
         assert_eq!(mono.bits[0], 0b1100_0000, "bottom row first: white, white, black");
         assert_eq!(mono.bits[4], 0b0110_0000, "top row: black, white, white");
         // Pure white and pure black stay solid; a flat 50% grey dithers to half dots.
-        let dots = |level: u8| -> u32 { dib_mono(&page(&[[level; 3]; 64]), 8, 8).bits.iter().map(|b| b.count_ones()).sum() };
+        let dots = |level: u8| -> u32 { dib_mono(&page(&[[level; 3]; 64]), 8, 8, 0).bits.iter().map(|b| b.count_ones()).sum() };
         assert_eq!(dots(255), 64, "white has no dots");
         assert_eq!(dots(0), 0, "black is solid");
         assert!((28..=36).contains(&dots(128)), "{} white cells of 64 at 50% grey", dots(128));
@@ -869,6 +1203,19 @@ mod tests {
         let rgb = dib_rgb(&rgba, 3, 2);
         assert_eq!(rgb.bits.len(), 24, "rows of 9 bytes padded to 12");
         assert_eq!(&rgb.bits[12..15], &[0, 0, 0]);
+    }
+
+    #[test]
+    fn bands_continue_the_dither_pattern() {
+        // A 50% grey sheet of 16 rows dithered whole equals the same sheet dithered as two
+        // 8-row bands with their y offsets: no seam.
+        let grey = page(&[[128; 3]; 8 * 16]);
+        let whole = dib_mono(&grey, 8, 16, 0);
+        let top = dib_mono(&grey[..8 * 8 * 4], 8, 8, 0);
+        let bottom = dib_mono(&grey[8 * 8 * 4..], 8, 8, 8);
+        // Bottom-up rows: the whole image's first 8 rows are the bottom band's.
+        assert_eq!(&whole.bits[..32], &bottom.bits[..]);
+        assert_eq!(&whole.bits[32..], &top.bits[..]);
     }
 
     /// A one-page PDF of `w` x `h` points with a filled black rectangle at `rect` (x, y, w, h,
@@ -919,11 +1266,60 @@ mod tests {
         for (x, y) in [(x0 - 5, y0 + 5), (x1 + 5, y1 - 5), (4096, y0 - 5), (4096, y1 + 5), (10, 10), (w - 10, h - 10)] {
             assert_eq!(px(x, y), [255, 255, 255], "white outside the square at {x}, {y}");
         }
+        // The same sheet in BAND_ROWS bands equals the whole render, row for row.
+        for y in (0..h).step_by(BAND_ROWS as usize) {
+            let rows = BAND_ROWS.min(h - y);
+            let band = render_band(&mut renderer, 0, scale, w, y, rows).unwrap();
+            assert_eq!(band.len(), (w * rows * 4) as usize);
+            assert_eq!(&band[..], &rgba[(y * w * 4) as usize..((y + rows) * w * 4) as usize], "band at row {y}");
+        }
         // A sheet within the caps renders whole, at the asked scale.
         let small = Arc::new(pdf_with_rect(612.0, 792.0, [0.0, 0.0, 10.0, 10.0]));
         let mut renderer = PageRenderer::new(small, pdfcraft_render::RenderConfig::default());
         let (w, h, _) = render_sheet(&mut renderer, 0, 612.0, 792.0, scale).unwrap();
         assert_eq!((w, h), (5100, 6600));
+    }
+
+    #[test]
+    fn the_render_worker_streams_large_sheets_and_sends_small_ones_whole() {
+        let pdf = Arc::new(pdf_with_rect(792.0, 1224.0, [100.0, 100.0, 50.0, 50.0]));
+        let scale = 600.0 / 72.0;
+        let plan = vec![
+            SheetPlan { index: 0, landscape: false, x: 0, y: 0, dest_w: 6600, dest_h: 10200, scale },
+            SheetPlan { index: 0, landscape: false, x: 0, y: 0, dest_w: 1100, dest_h: 1700, scale: 100.0 / 72.0 },
+        ];
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let sizes = vec![(792.0, 1224.0)];
+        let worker = std::thread::spawn(move || render_worker(pdf, sizes, plan, tx));
+        let mut bands = 0;
+        let mut rows = 0;
+        match rx.recv().unwrap() {
+            Msg::Begin { w, h, probe_w, probe_h, .. } => {
+                assert_eq!((w, h), (6600, 10200));
+                assert!(probe_w < 4096 && probe_h < 4096, "the probe is small: {probe_w} x {probe_h}");
+            }
+            _ => panic!("a Tabloid sheet at 600 dpi streams"),
+        }
+        loop {
+            match rx.recv().unwrap() {
+                Msg::Band { rows: r, rgba, .. } => {
+                    bands += 1;
+                    rows += r;
+                    assert_eq!(rgba.len(), (6600 * r * 4) as usize);
+                }
+                Msg::End => break,
+                Msg::Error(e) => panic!("{e}"),
+                _ => panic!("unexpected message"),
+            }
+        }
+        assert_eq!(rows, 10200);
+        assert_eq!(bands, 10200_u32.div_ceil(BAND_ROWS));
+        match rx.recv().unwrap() {
+            Msg::Whole { w, h, .. } => assert_eq!((w, h), (1100, 1700)),
+            _ => panic!("a small sheet comes whole"),
+        }
+        assert!(rx.recv().is_err(), "nothing after the last sheet");
+        worker.join().unwrap();
     }
 
     #[test]

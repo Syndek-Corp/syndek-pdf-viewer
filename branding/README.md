@@ -36,6 +36,12 @@ and sends it through the classic GDI print path, as Acrobat does, in the smalles
 takes (1-bit for black-and-white sheets, JPEG for colour on PostScript drivers). Same document:
 about 3–7 s and 2–30 MB.
 
+Sheets render at the printer's resolution (up to 600 dpi; a 1200 dpi driver gets 600 dpi images
+scaled up). Letter-size sheets render whole; larger ones (Legal, Tabloid, plotter sizes) are
+rendered and sent in bands, so any paper size prints at full resolution within a fixed amount of
+memory. The next sheet renders while the current one is sent. Paper sizes the driver doesn't list
+are requested as a custom size when the driver accepts custom sizes.
+
 `apply.py` copies the crate into `crates/print-windows` and routes `pdfcraft-print`'s `submit`
 to it at build time, so upstream's files are untouched for syncing. If upstream rewrites
 `crates/print/src/spool.rs`, the build stops at the branding step and names it; update that entry.

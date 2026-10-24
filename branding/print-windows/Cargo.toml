@@ -1,0 +1,24 @@
+[package]
+name = "pdfcraft-print-windows"
+description = "DocuView's Windows print backend: sheets rendered by the app's own renderer and sent through the classic GDI print path"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Lives in branding/ and is copied to crates/print-windows by branding/apply.py at build time, so
+# the upstream tree (and its Cargo.lock) stays untouched for syncing. GDI is an unsafe C API, so
+# this crate does not take the workspace's `unsafe_code = "forbid"` lint; every call is wrapped.
+
+[dependencies]
+pdfcraft-render = { path = "../render" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", default-features = false, features = [
+    "std",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Printing",
+    "Win32_Storage_Xps",
+] }

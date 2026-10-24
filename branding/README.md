@@ -27,6 +27,22 @@ relies on. The log names the exact file and text; update that entry in `apply.py
 - Never change `UPGRADE_CODE` or `COMPONENT_GUIDS` after release. Windows uses them to upgrade and
   uninstall DocuView.
 
+## Windows printing (DocuView's own backend)
+`branding/print-windows/` is a small Rust crate that replaces the Windows print path. Upstream
+prints through Windows' PDF renderer and the XPS print API; on the office copiers' drivers that
+rasterises every page at 600 dpi and converts it page by page (measured: 44 s and 191 MB for a
+10-page document on the Toshiba PS3 driver). DocuView renders each sheet with its own renderer
+and sends it through the classic GDI print path, as Acrobat does, in the smallest form the driver
+takes (1-bit for black-and-white sheets, JPEG for colour on PostScript drivers). Same document:
+about 3–7 s and 2–30 MB.
+
+`apply.py` copies the crate into `crates/print-windows` and routes `pdfcraft-print`'s `submit`
+to it at build time, so upstream's files are untouched for syncing. If upstream rewrites
+`crates/print/src/spool.rs`, the build stops at the branding step and names it; update that entry.
+
+To see exactly what a job sends, set `DOCUVIEW_PRINT_DUMP=C:\some\folder` before starting
+DocuView: every sheet is written there as an image as it goes to the driver.
+
 ## Signing
 Windows signing turns on automatically once the six `AZURE_*` secrets are set in the `release`
 environment (see issue #1). Until then the build ships unsigned and Windows shows an

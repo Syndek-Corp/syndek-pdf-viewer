@@ -135,6 +135,65 @@ EDITS: list[tuple[str, str, str, int | None]] = [
         '{\\field{\\*\\fldinst{HYPERLINK "' + FEEDBACK_URL + '"}}{\\fldrslt Send feedback}}',
         1,
     ),
+    # Windows printing: route jobs through branding/print-windows (GDI) instead of craft-print's
+    # XPS path. See branding/print-windows/src/lib.rs for the measurements behind this.
+    (
+        "crates/print/Cargo.toml",
+        "[dev-dependencies]\n",
+        "[target.'cfg(windows)'.dependencies]\npdfcraft-print-windows = { path = \"../print-windows\" }\n\n[dev-dependencies]\n",
+        1,
+    ),
+    (
+        "crates/print/src/spool.rs",
+        """pub fn submit(pdf: &[u8], job: &Job) -> Result<String, crate::PrintError> {
+    craft_print::submit(pdf, job).map_err(|e| crate::PrintError::Spool(e.to_string()))
+}
+
+/// [`submit`], told `(sent, sheets)` as each sheet reaches the spooler (Windows; CUPS takes the
+/// whole PDF at once and reports nothing).
+pub fn submit_with_progress(pdf: &[u8], job: &Job, progress: &mut dyn FnMut(usize, usize)) -> Result<String, crate::PrintError> {
+    craft_print::submit_with_progress(pdf, job, progress).map_err(|e| crate::PrintError::Spool(e.to_string()))
+}
+""",
+        """pub fn submit(pdf: &[u8], job: &Job) -> Result<String, crate::PrintError> {
+    submit_with_progress(pdf, job, &mut |_, _| {})
+}
+
+/// [`submit`], told `(sent, sheets)` as each sheet reaches the spooler (Windows; CUPS takes the
+/// whole PDF at once and reports nothing).
+#[cfg(not(windows))]
+pub fn submit_with_progress(pdf: &[u8], job: &Job, progress: &mut dyn FnMut(usize, usize)) -> Result<String, crate::PrintError> {
+    craft_print::submit_with_progress(pdf, job, progress).map_err(|e| crate::PrintError::Spool(e.to_string()))
+}
+
+/// DocuView: on Windows the sheets go through the classic GDI print path (`pdfcraft-print-windows`)
+/// instead of craft-print's XPS path, which rasterises every page through the Windows PDF
+/// renderer and ships ~20 MB a page to PostScript drivers.
+#[cfg(windows)]
+pub fn submit_with_progress(pdf: &[u8], job: &Job, progress: &mut dyn FnMut(usize, usize)) -> Result<String, crate::PrintError> {
+    let gdi = pdfcraft_print_windows::Job {
+        printer: job.printer.as_deref(),
+        copies: job.copies,
+        collate: job.collate,
+        duplex: match job.duplex {
+            None => pdfcraft_print_windows::Duplex::Default,
+            Some(Duplex::Off) => pdfcraft_print_windows::Duplex::Off,
+            Some(Duplex::LongEdge) => pdfcraft_print_windows::Duplex::LongEdge,
+            Some(Duplex::ShortEdge) => pdfcraft_print_windows::Duplex::ShortEdge,
+        },
+        grayscale: job.grayscale,
+        title: &job.title,
+        shrink_to_fit: job.scaling == Scaling::ShrinkToFit,
+    };
+    pdfcraft_print_windows::submit_with_progress(pdf, &gdi, progress).map_err(crate::PrintError::Spool)
+}
+""",
+        1,
+    ),
+    # The new crate joins the workspace (crates/*), so Cargo.lock gains an entry at build time;
+    # cargo keeps every existing version pinned, it only adds the new package.
+    ("packaging/windows/package.ps1", "cargo build --release --locked ", "cargo build --release ", 1),
+    ("packaging/macos/package.sh", "cargo build --release --locked ", "cargo build --release ", 1),
     # macOS bundle identity.
     ("packaging/macos/Info.plist.in", "ai.storyteller.pdfcraft", BUNDLE_ID, None),
     ("packaging/macos/Info.plist.in", "Copyright © the DocuView authors.", f"Copyright © {COMPANY} and the PdfCraft authors.", 1),
@@ -211,6 +270,14 @@ def main() -> int:
             continue
         shutil.copyfile(ASSETS / src, target)
     print(f"replaced {len(COPIES)} icon and logo files")
+
+    # The Windows print backend crate, into the workspace (crates/* are members).
+    crate_src = Path(__file__).resolve().parent / "print-windows"
+    crate_dst = ROOT / "crates" / "print-windows"
+    if crate_dst.exists():
+        shutil.rmtree(crate_dst)
+    shutil.copytree(crate_src, crate_dst, ignore=shutil.ignore_patterns("target", "Cargo.lock"))
+    print("added crates/print-windows")
 
     if problems:
         print("\nBranding failed; upstream changed something this script relies on:", file=sys.stderr)

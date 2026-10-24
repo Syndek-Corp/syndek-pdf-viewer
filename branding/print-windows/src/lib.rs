@@ -25,6 +25,8 @@
 
 use std::sync::Arc;
 
+use pdfcraft_render::{PRINT_TAG, PageRenderer, RenderRequest, Tile, device_pixels, effective_scale};
+
 /// Two-sided printing. `Default` leaves the printer's own setting in force.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Duplex {
@@ -60,6 +62,66 @@ fn sheet_sizes(pdf: &Arc<Vec<u8>>) -> Result<Vec<(f32, f32)>, String> {
     Ok(sizes)
 }
 
+/// Render sheet `page` at `scale` device pixels per point as premultiplied RGBA: `(width,
+/// height, pixels)`. A sheet the renderer can draw in one go (its caps: 8192 px a side, 64 M
+/// pixels) is rendered whole; a larger one (Legal and Tabloid at 600 dpi, anything bigger) is
+/// rendered in tiles at the full scale and stitched, so no sheet is sent below the printer's
+/// resolution. A sheet that would need more than [`MAX_SHEET_BYTES`] falls back to the
+/// renderer's capped whole-page render, which the driver then scales up.
+fn render_sheet(renderer: &mut PageRenderer, page: usize, w_pt: f32, h_pt: f32, scale: f32) -> Result<(u32, u32, Vec<u8>), String> {
+    let n = page + 1;
+    let capped = effective_scale(w_pt, h_pt, scale);
+    let (full_w, full_h) = (device_pixels(w_pt, scale), device_pixels(h_pt, scale));
+    let bytes = u64::from(full_w) * u64::from(full_h) * 4;
+    if capped >= scale * 0.999 || bytes > MAX_SHEET_BYTES || full_w == 0 || full_h == 0 {
+        let r = renderer.render(RenderRequest { page, scale: capped, tag: PRINT_TAG, ..Default::default() });
+        if let Some(e) = r.error {
+            return Err(format!("sheet {n} could not be rendered: {e}"));
+        }
+        if r.width == 0 || r.height == 0 {
+            return Err(format!("sheet {n} rendered empty"));
+        }
+        return Ok((r.width, r.height, r.rgba.to_vec()));
+    }
+    let mut rgba = Vec::new();
+    rgba.try_reserve_exact(bytes as usize).map_err(|_| format!("sheet {n}: not enough memory for a {full_w} x {full_h} render"))?;
+    rgba.resize(bytes as usize, 0);
+    let fw = full_w as usize;
+    for ty in (0..full_h).step_by(TILE as usize) {
+        for tx in (0..full_w).step_by(TILE as usize) {
+            let (tw, th) = (TILE.min(full_w - tx), TILE.min(full_h - ty));
+            let r =
+                renderer.render(RenderRequest { page, scale, tile: Some(Tile { x: tx, y: ty, w: tw, h: th }), tag: PRINT_TAG, ..Default::default() });
+            if let Some(e) = r.error {
+                return Err(format!("sheet {n} could not be rendered (tile at {tx}, {ty}): {e}"));
+            }
+            let (rw, rh) = (r.width as usize, r.height as usize);
+            let (cw, ch) = (rw.min(tw as usize), rh.min(th as usize));
+            if cw < tw as usize || ch < th as usize {
+                return Err(format!("sheet {n}: tile at {tx}, {ty} came back {rw} x {rh}, not {tw} x {th}"));
+            }
+            let src = r.rgba.to_vec();
+            for row in 0..ch {
+                let (Some(from), Some(to)) = (
+                    src.get(row * rw * 4..(row * rw + cw) * 4),
+                    rgba.get_mut(((ty as usize + row) * fw + tx as usize) * 4..((ty as usize + row) * fw + tx as usize + cw) * 4),
+                ) else {
+                    return Err(format!("sheet {n}: tile at {tx}, {ty} is out of bounds"));
+                };
+                to.copy_from_slice(from);
+            }
+        }
+    }
+    Ok((full_w, full_h, rgba))
+}
+
+/// The renderer draws a tile of at most this many pixels a side.
+const TILE: u32 = 4096;
+
+/// Beyond this (an A0 sheet at 600 dpi is 1.4 GB) the sheet is rendered at the renderer's
+/// capped resolution instead; the driver scales it to the paper.
+const MAX_SHEET_BYTES: u64 = 640 * 1024 * 1024;
+
 /// What a rendered sheet needs: the fewest bits that reproduce it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Depth {
@@ -78,7 +140,7 @@ fn classify(rgba: &[u8], grayscale: bool) -> Depth {
     let mut mid = 0usize;
     let mut total = 0usize;
     let mut color = false;
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0 {
         let (r, g, b) = (px[0], px[1], px[2]);
         if !grayscale && (r.abs_diff(g) > 8 || g.abs_diff(b) > 8) {
             color = true;
@@ -118,7 +180,7 @@ const BAYER: [[u8; 8]; 8] = [
 
 /// Premultiplied RGBA composed over opaque white, optionally as grey (Rec. 601 luma).
 fn over_white(rgba: &mut [u8], grayscale: bool) {
-    for px in rgba.chunks_exact_mut(4) {
+    for px in rgba.as_chunks_mut::<4>().0 {
         let gap = 255 - u32::from(px[3]);
         let (r, g, b) = ((u32::from(px[0]) + gap).min(255), (u32::from(px[1]) + gap).min(255), (u32::from(px[2]) + gap).min(255));
         let (r, g, b) = if grayscale {
@@ -177,19 +239,19 @@ fn pack_rows(rgba: &[u8], width: usize, height: usize, row_bytes: usize, mut pac
 
 fn dib_mono(rgba: &[u8], width: u32, height: u32) -> Dib {
     let (w, h) = (width as usize, height as usize);
-    let row_bytes = (w + 31) / 32 * 4;
+    let row_bytes = w.div_ceil(32) * 4;
     let mut y_row = 0usize;
     let bits = pack_rows(rgba, w, h, row_bytes, |row, out| {
         let bayer = &BAYER[y_row % 8];
         y_row += 1;
-        for (x, px) in row.chunks_exact(4).enumerate() {
+        for (x, px) in row.as_chunks::<4>().0.iter().enumerate() {
             let y = (299 * u32::from(px[0]) + 587 * u32::from(px[1]) + 114 * u32::from(px[2])) / 1000;
             // Luminance scaled to 0..=64 against the cell's threshold (0..=63): pure white
             // clears every cell, pure black none, and 50% grey half of them.
-            if y * 64 / 255 > u32::from(bayer[x % 8]) {
-                if let Some(b) = out.get_mut(x / 8) {
-                    *b |= 0x80 >> (x % 8);
-                }
+            if y * 64 / 255 > u32::from(bayer[x % 8])
+                && let Some(b) = out.get_mut(x / 8)
+            {
+                *b |= 0x80 >> (x % 8);
             }
         }
     });
@@ -202,7 +264,7 @@ fn dib_gray(rgba: &[u8], width: u32, height: u32) -> Dib {
     let (w, h) = (width as usize, height as usize);
     let row_bytes = (w + 3) & !3;
     let bits = pack_rows(rgba, w, h, row_bytes, |row, out| {
-        for (px, o) in row.chunks_exact(4).zip(out.iter_mut()) {
+        for (px, o) in row.as_chunks::<4>().0.iter().zip(out.iter_mut()) {
             *o = ((299 * u32::from(px[0]) + 587 * u32::from(px[1]) + 114 * u32::from(px[2])) / 1000) as u8;
         }
     });
@@ -217,7 +279,7 @@ fn dib_rgb(rgba: &[u8], width: u32, height: u32) -> Dib {
     let (w, h) = (width as usize, height as usize);
     let row_bytes = (w * 3 + 3) & !3;
     let bits = pack_rows(rgba, w, h, row_bytes, |row, out| {
-        for (px, o) in row.chunks_exact(4).zip(out.chunks_exact_mut(3)) {
+        for (px, o) in row.as_chunks::<4>().0.iter().zip(out.chunks_exact_mut(3)) {
             o[0] = px[2];
             o[1] = px[1];
             o[2] = px[0];
@@ -232,7 +294,7 @@ fn dib_jpeg(rgba: &[u8], width: u32, height: u32, dpi: f64) -> Result<Dib, Strin
     use image::codecs::jpeg::{JpegEncoder, PixelDensity};
     let (w, h) = (width as usize, height as usize);
     let mut rgb = Vec::with_capacity(w * h * 3);
-    for px in rgba.chunks_exact(4).take(w * h) {
+    for px in rgba.as_chunks::<4>().0.iter().take(w * h) {
         rgb.extend_from_slice(&px[..3]);
     }
     let mut out = Vec::new();
@@ -269,7 +331,7 @@ mod gdi {
     use windows::core::{PCWSTR, PWSTR};
 
     use super::{Depth, Dib, Duplex, Job, classify, dib_gray, dib_jpeg, dib_mono, dib_rgb, over_white, sheet_sizes};
-    use pdfcraft_render::{PRINT_TAG, PageRenderer, RenderConfig, RenderRequest, effective_scale};
+    use pdfcraft_render::{PageRenderer, RenderConfig};
 
     // DEVMODE field flags and values (wingdi.h).
     const DM_ORIENTATION: u32 = 0x0000_0001;
@@ -357,7 +419,14 @@ mod gdi {
             let input = dm.clone();
             // SAFETY: both buffers are full DEVMODEs of the driver's own size.
             let r = unsafe {
-                DocumentPropertiesW(None, self.handle, PCWSTR(self.name.as_ptr()), Some(dm.as_mut_ptr()), Some(input.as_ptr()), DM_IN_BUFFER | DM_OUT_BUFFER)
+                DocumentPropertiesW(
+                    None,
+                    self.handle,
+                    PCWSTR(self.name.as_ptr()),
+                    Some(dm.as_mut_ptr()),
+                    Some(input.as_ptr()),
+                    DM_IN_BUFFER | DM_OUT_BUFFER,
+                )
             };
             if r < 0 { Err(last_error("applying the print settings")) } else { Ok(()) }
         }
@@ -563,7 +632,7 @@ mod gdi {
                 let mut grey = vec![0u8; w * h];
                 match depth {
                     "mono" => {
-                        let row_bytes = (w + 31) / 32 * 4;
+                        let row_bytes = w.div_ceil(32) * 4;
                         for y in 0..h {
                             let row = &dib.bits[(h - 1 - y) * row_bytes..];
                             for x in 0..w {
@@ -610,7 +679,9 @@ mod gdi {
         // Exact size: every sheet must be the first one's size, either way round (as upstream).
         if !job.shrink_to_fit {
             let same = |a: f32, b: f32| (a - b).abs() <= 1.0;
-            if let Some((i, s)) = sizes.iter().enumerate().find(|(_, s)| !(same(s.0, first.0) && same(s.1, first.1) || same(s.0, first.1) && same(s.1, first.0))) {
+            if let Some((i, s)) =
+                sizes.iter().enumerate().find(|(_, s)| !(same(s.0, first.0) && same(s.1, first.1) || same(s.0, first.1) && same(s.1, first.0)))
+            {
                 return Err(format!(
                     "sheet {} is {:.2} × {:.2} inches but sheet 1 is {:.2} × {:.2}: choose shrink-to-fit, or print them separately",
                     i + 1,
@@ -724,27 +795,19 @@ mod gdi {
             } else {
                 (sheet_w.max(1), sheet_h.max(1), -off_x, -off_y)
             };
-            // Render at the printer's resolution (capped by the renderer's limits; the
-            // stretch below maps whatever came back onto the sheet).
-            let scale = effective_scale(w_pt, h_pt, (f64::from(dest_w) / f64::from(w_pt.max(1.0))) as f32);
-            let r = renderer.render(RenderRequest { page: i, scale, tag: PRINT_TAG, ..Default::default() });
-            if let Some(e) = r.error {
-                return Err(format!("sheet {} could not be rendered: {e}", i + 1));
-            }
-            if r.width == 0 || r.height == 0 {
-                return Err(format!("sheet {} rendered empty", i + 1));
-            }
-            let mut rgba = r.rgba.to_vec();
+            // Render at the printer's resolution: one device pixel per printer dot.
+            let scale = (f64::from(dest_w) / f64::from(w_pt.max(1.0))) as f32;
+            let (rw, rh, mut rgba) = super::render_sheet(&mut renderer, i, w_pt, h_pt, scale)?;
             over_white(&mut rgba, job.grayscale);
             let dib = match classify(&rgba, job.grayscale) {
-                Depth::Mono => dib_mono(&rgba, r.width, r.height),
-                Depth::Gray => dib_gray(&rgba, r.width, r.height),
-                Depth::Color if jpeg => dib_jpeg(&rgba, r.width, r.height, f64::from(dpi_x))?,
-                Depth::Color => dib_rgb(&rgba, r.width, r.height),
+                Depth::Mono => dib_mono(&rgba, rw, rh),
+                Depth::Gray => dib_gray(&rgba, rw, rh),
+                Depth::Color if jpeg => dib_jpeg(&rgba, rw, rh, f64::from(dpi_x))?,
+                Depth::Color => dib_rgb(&rgba, rw, rh),
             };
-            dump_sheet(&dib, &rgba, r.width, r.height, i);
+            dump_sheet(&dib, &rgba, rw, rh, i);
             drop(rgba);
-            doc.page(&dib, (x, y, dest_w, dest_h), (r.width, r.height))?;
+            doc.page(&dib, (x, y, dest_w, dest_h), (rw, rh))?;
             sent += 1;
             progress(sent.min(count), count);
         }
@@ -806,6 +869,61 @@ mod tests {
         let rgb = dib_rgb(&rgba, 3, 2);
         assert_eq!(rgb.bits.len(), 24, "rows of 9 bytes padded to 12");
         assert_eq!(&rgb.bits[12..15], &[0, 0, 0]);
+    }
+
+    /// A one-page PDF of `w` x `h` points with a filled black rectangle at `rect` (x, y, w, h,
+    /// PDF user space, origin bottom-left).
+    fn pdf_with_rect(w: f32, h: f32, rect: [f32; 4]) -> Vec<u8> {
+        let content = format!("0 0 0 rg {} {} {} {} re f", rect[0], rect[1], rect[2], rect[3]);
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w} {h}] /Contents 4 0 R >>"),
+            format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+        ];
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, o) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes());
+        for off in offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1).as_bytes());
+        out
+    }
+
+    #[test]
+    fn oversized_sheets_render_at_full_resolution_in_tiles_without_seams() {
+        // Tabloid at 600 dpi: 6600 x 10200, beyond the renderer's 8192-px side cap, so tiled
+        // (two columns, three rows). The square straddles both tile seams.
+        let pdf = Arc::new(pdf_with_rect(792.0, 1224.0, [400.0, 624.0, 200.0, 200.0]));
+        let mut renderer = PageRenderer::new(Arc::clone(&pdf), pdfcraft_render::RenderConfig::default());
+        let scale = 600.0 / 72.0;
+        let (w, h, rgba) = render_sheet(&mut renderer, 0, 792.0, 1224.0, scale).unwrap();
+        assert_eq!((w, h), (6600, 10200));
+        let px = |x: u32, y: u32| -> [u8; 3] {
+            let i = ((y * w + x) * 4) as usize;
+            [rgba[i], rgba[i + 1], rgba[i + 2]]
+        };
+        // PDF y is bottom-up: the square spans x 400-600 pt and, from the top, y 400-600 pt.
+        let (x0, x1) = ((400.0 * scale) as u32, (600.0 * scale) as u32);
+        let (y0, y1) = ((400.0 * scale) as u32, (600.0 * scale) as u32);
+        assert!(x0 < 4096 && x1 > 4096 && y0 < 4096 && y1 > 4096, "the square must cross the seams at 4096");
+        for (x, y) in [(x0 + 5, y0 + 5), (4095, y0 + 5), (4096, y0 + 5), (x0 + 5, 4095), (x0 + 5, 4096), (4096, 4096), (x1 - 5, y1 - 5)] {
+            assert_eq!(px(x, y), [0, 0, 0], "black inside the square at {x}, {y}");
+        }
+        for (x, y) in [(x0 - 5, y0 + 5), (x1 + 5, y1 - 5), (4096, y0 - 5), (4096, y1 + 5), (10, 10), (w - 10, h - 10)] {
+            assert_eq!(px(x, y), [255, 255, 255], "white outside the square at {x}, {y}");
+        }
+        // A sheet within the caps renders whole, at the asked scale.
+        let small = Arc::new(pdf_with_rect(612.0, 792.0, [0.0, 0.0, 10.0, 10.0]));
+        let mut renderer = PageRenderer::new(small, pdfcraft_render::RenderConfig::default());
+        let (w, h, _) = render_sheet(&mut renderer, 0, 612.0, 792.0, scale).unwrap();
+        assert_eq!((w, h), (5100, 6600));
     }
 
     #[test]

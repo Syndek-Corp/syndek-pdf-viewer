@@ -31,6 +31,8 @@ REPO_URL = f"https://github.com/{REPO}"
 FEEDBACK_URL = f"{REPO_URL}/issues/new"
 RELEASES_URL = f"{REPO_URL}/releases"
 BUNDLE_ID = "com.syndek.docuview"
+# Folder under Program Files (and %LOCALAPPDATA%\Programs) that holds the DocuView folder.
+SUITE_FOLDER = "Syndek"
 
 # Fixed for the life of the product: Windows uses these to recognise DocuView on upgrade and
 # uninstall. New ones (not PdfCraft's) so DocuView and PdfCraft never replace each other.
@@ -50,10 +52,11 @@ NAME_SCOPE = [
     "apps/pdfcraft/build.rs",
     "apps/pdfcraft/src/**/*.rs",
     "crates/ui-egui/src/**/*.rs",
-    "crates/ui-egui/src/i18n/*.tsv",
     "crates/engine/src/commands.rs",
     "crates/engine/src/links.rs",
     "packaging/windows/*.wxs",
+    "packaging/windows/*.wxi",
+    "packaging/windows/install-policy.json",
     "packaging/windows/*.ps1",
     "packaging/macos/package.sh",
     "packaging/macos/Info.plist.in",
@@ -95,9 +98,18 @@ EDITS: list[tuple[str, str, str, int | None]] = [
         f'ui.label(egui::RichText::new("{COMPANY}").font(theme::semibold(14.0)));',
         1,
     ),
-    # Help > Check for updates asks this repository's releases, not upstream's.
-    ("crates/ui-egui/src/updates.rs", "https://github.com/storytold/pdfcraft/releases", RELEASES_URL, 1),
-    ("apps/pdfcraft/src/updates.rs", "https://api.github.com/repos/storytold/pdfcraft/releases/latest", f"https://api.github.com/repos/{REPO}/releases/latest", 1),
+    # Updates (craft-update, since 0.14): checks and the "newer version" prompt use this
+    # repository's releases and DocuView's name; never upstream's PdfCraft installer. craft-update
+    # only installs by itself for Learning Machines' own MSI, so DocuView users are offered the
+    # download page, and the MSI upgrades in place.
+    ("crates/ui-egui/src/platform/updates.rs", '"https://github.com/storytold/pdfcraft/releases"', f'"{RELEASES_URL}"', 1),
+    (
+        "crates/ui-egui/src/lib.rs",
+        "    accent: Some([0xb7, 0x02, 0x28]),\n    ..craft_update::suite::PDFCRAFT\n",
+        f'    accent: Some([0x1f, 0x5f, 0xbf]),\n    name: "{APP_NAME}",\n    repo: "{REPO}",\n    developer: "{COMPANY}",\n'
+        '    former_ids: &["docuview", "printcraft"],\n    ..craft_update::suite::PDFCRAFT\n',
+        1,
+    ),
     # Windows executable details (Properties > Details, Task Manager).
     ("apps/pdfcraft/build.rs", '"DocuView PDF workbench"', f'"{APP_NAME} PDF viewer"', 1),
     (
@@ -111,6 +123,14 @@ EDITS: list[tuple[str, str, str, int | None]] = [
     ("packaging/windows/test-msi.ps1", "'Learning Machines LLC'", f"'{COMPANY}'", 1),
     # The UpgradeCode, and (since 0.9.0) the <Upgrade> table that detects earlier installs of it.
     ("packaging/windows/pdfcraft.wxs", "EA00C367-7270-4C50-9D8B-A7A5C88AD27F", UPGRADE_CODE, None),
+    ("packaging/windows/install-policy.json", '"EA00C367-7270-4C50-9D8B-A7A5C88AD27F"', f'"{UPGRADE_CODE}"', 1),
+    # Install folder (since 0.14): Program Files\ArtCraft\PdfCraft -> Program Files\Syndek\DocuView.
+    # The ArtCraft name is a trademark forks must not use; the policy check asserts the folder.
+    ("packaging/windows/pdfcraft.wxs", '<Directory Id="CraftSuiteFolder" Name="ArtCraft">', f'<Directory Id="CraftSuiteFolder" Name="{SUITE_FOLDER}">', 1),
+    ("packaging/windows/install-policy.wxi", "ArtCraft", SUITE_FOLDER, None),
+    ("packaging/windows/check-install-policy.ps1", "'ArtCraft'", f"'{SUITE_FOLDER}'", None),
+    ("packaging/windows/check-install-policy.ps1", '"ArtCraft\\$($policy.name)"', f'"{SUITE_FOLDER}\\$($policy.name)"', 1),
+    ("packaging/windows/check-install-policy.ps1", '"Programs\\ArtCraft\\$($policy.name)"', f'"Programs\\{SUITE_FOLDER}\\$($policy.name)"', 1),
     *[("packaging/windows/pdfcraft.wxs", old, new, 1) for old, new in COMPONENT_GUIDS.items()],
     ("packaging/windows/pdfcraft.wxs", '"https://getartcraft.com/apps/pdfcraft"', f'"{RELEASES_URL}"', 2),
     ("packaging/windows/pdfcraft.wxs", '"https://discord.gg/artcraft"', f'"{FEEDBACK_URL}"', 1),
@@ -139,38 +159,31 @@ EDITS: list[tuple[str, str, str, int | None]] = [
     # XPS path. See branding/print-windows/src/lib.rs for the measurements behind this.
     (
         "crates/print/Cargo.toml",
-        "[dev-dependencies]\n",
-        "[target.'cfg(windows)'.dependencies]\npdfcraft-print-windows = { path = \"../print-windows\" }\n\n[dev-dependencies]\n",
+        "[target.'cfg(windows)'.dependencies]\n",
+        "[target.'cfg(windows)'.dependencies]\npdfcraft-print-windows = { path = \"../print-windows\" }\n",
         1,
     ),
     (
         "crates/print/src/spool.rs",
-        """pub fn submit(pdf: &[u8], job: &Job) -> Result<String, crate::PrintError> {
-    craft_print::submit(pdf, job).map_err(|e| crate::PrintError::Spool(e.to_string()))
-}
-
-/// [`submit`], told `(sent, sheets)` as each sheet reaches the spooler (Windows; CUPS takes the
-/// whole PDF at once and reports nothing).
-pub fn submit_with_progress(pdf: &[u8], job: &Job, progress: &mut dyn FnMut(usize, usize)) -> Result<String, crate::PrintError> {
-    craft_print::submit_with_progress(pdf, job, progress).map_err(|e| crate::PrintError::Spool(e.to_string()))
-}
-""",
-        """pub fn submit(pdf: &[u8], job: &Job) -> Result<String, crate::PrintError> {
-    submit_with_progress(pdf, job, &mut |_, _| {})
-}
-
-/// [`submit`], told `(sent, sheets)` as each sheet reaches the spooler (Windows; CUPS takes the
-/// whole PDF at once and reports nothing).
-#[cfg(not(windows))]
-pub fn submit_with_progress(pdf: &[u8], job: &Job, progress: &mut dyn FnMut(usize, usize)) -> Result<String, crate::PrintError> {
-    craft_print::submit_with_progress(pdf, job, progress).map_err(|e| crate::PrintError::Spool(e.to_string()))
+        "    craft_print::submit(&pdf, &spooled(job)).map_err(|e| crate::PrintError::Spool(e.to_string()))\n}\n",
+        "    #[cfg(windows)]\n    return docuview_gdi_submit(&pdf, job, &mut |_, _| {});\n    #[cfg(not(windows))]\n"
+        "    craft_print::submit(&pdf, &spooled(job)).map_err(|e| crate::PrintError::Spool(e.to_string()))\n}\n",
+        1,
+    ),
+    (
+        "crates/print/src/spool.rs",
+        "    craft_print::submit_with_progress(&pdf, &spooled(job), progress).map_err(|e| crate::PrintError::Spool(e.to_string()))\n}\n",
+        """    #[cfg(windows)]
+    return docuview_gdi_submit(&pdf, job, progress);
+    #[cfg(not(windows))]
+    craft_print::submit_with_progress(&pdf, &spooled(job), progress).map_err(|e| crate::PrintError::Spool(e.to_string()))
 }
 
 /// DocuView: on Windows the sheets go through the classic GDI print path (`pdfcraft-print-windows`)
 /// instead of craft-print's XPS path, which rasterises every page through the Windows PDF
-/// renderer and ships ~20 MB a page to PostScript drivers.
+/// renderer and, on a v3 driver, converts it page by page (storytold/pdfcraft#4509).
 #[cfg(windows)]
-pub fn submit_with_progress(pdf: &[u8], job: &Job, progress: &mut dyn FnMut(usize, usize)) -> Result<String, crate::PrintError> {
+fn docuview_gdi_submit(pdf: &[u8], job: &Job, progress: &mut dyn FnMut(usize, usize)) -> Result<String, crate::PrintError> {
     let gdi = pdfcraft_print_windows::Job {
         printer: job.printer.as_deref(),
         copies: job.copies,
@@ -259,7 +272,7 @@ def main() -> int:
     # Every installer GUID must now be one of DocuView's. A GUID upstream adds later (a new
     # component) would otherwise be shared with PdfCraft installs; give it its own entry above.
     ours = {UPGRADE_CODE, *COMPONENT_GUIDS.values()}
-    for path in sorted((ROOT / "packaging/windows").glob("*.wxs")):
+    for path in sorted([*(ROOT / "packaging/windows").glob("*.wxs"), *(ROOT / "packaging/windows").glob("*.wxi"), ROOT / "packaging/windows/install-policy.json"]):
         for guid in sorted(set(GUID_RE.findall(read(path))) - ours):
             problems.append(f"{path.relative_to(ROOT).as_posix()}: GUID {guid} is upstream's; add a DocuView one to COMPONENT_GUIDS")
 

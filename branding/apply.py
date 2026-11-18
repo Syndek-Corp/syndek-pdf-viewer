@@ -136,6 +136,7 @@ EDITS: list[tuple[str, str, str, int | None]] = [
     ("packaging/windows/pdfcraft.wxs", '"https://discord.gg/artcraft"', f'"{FEEDBACK_URL}"', 1),
     ("packaging/windows/pdfcraft.wxs", '"DocuView PDF workbench"', f'"{APP_NAME} PDF viewer"', None),
     ("packaging/windows/pdfcraft.wxs", '"Open-source PDF workbench"', '"PDF viewer and editor"', 1),
+    ("packaging/windows/install-policy.json", '"Open-source PDF workbench"', '"PDF viewer and editor"', 1),
     # macOS About panel (since 0.9.0).
     (
         "packaging/macos/Credits.rtf",
